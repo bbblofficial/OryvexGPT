@@ -48,8 +48,9 @@ def pick_device(pref: str = "auto") -> str:
 
 class OryvexEngine:
     def __init__(self, model: OryvexGPT, tok: BPETokenizer, system: str, device: str,
-                 gen: GenConfig | None = None, meta: dict | None = None):
+                 gen: GenConfig | None = None, meta: dict | None = None, ckpt_path: str | None = None):
         self.model, self.tok, self.system, self.device = model, tok, system, device
+        self.ckpt_path = ckpt_path
         self.gen = gen or GenConfig()
         self.meta = meta or {}
         self.lock = threading.Lock()  # one generation at a time
@@ -64,7 +65,19 @@ class OryvexEngine:
         model.load_state_dict(ckpt["model"])
         model.to(device).eval()
         tok = BPETokenizer([tuple(m) for m in ckpt["merges"]])
-        return cls(model, tok, system or ckpt["system"], device, gen, ckpt.get("meta", {}))
+        return cls(model, tok, system or ckpt["system"], device, gen, ckpt.get("meta", {}), path)
+
+    def reload(self, path: str | None = None):
+        """Hot-swap in new weights (e.g. after learn mode fine-tuned the model)."""
+        path = path or self.ckpt_path
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        model = OryvexGPT(GPTConfig(**ckpt["config"]))
+        model.load_state_dict(ckpt["model"])
+        model.to(self.device).eval()
+        tok = BPETokenizer([tuple(m) for m in ckpt["merges"]])
+        with self.lock:  # waits for any reply in progress
+            self.model, self.tok, self.block = model, tok, model.cfg.block_size
+            self.meta, self.ckpt_path = ckpt.get("meta", {}), path
 
     # ------------------------------------------------------------- prompt
     def _build_ids(self, session: ChatSession) -> list[int]:

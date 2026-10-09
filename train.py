@@ -33,13 +33,14 @@ from engine import pick_device
 def load_examples(data_dir: str, dataset_size: int):
     os.makedirs(data_dir, exist_ok=True)
     jsonl = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
-    if not jsonl:
+    if not [p for p in jsonl if os.path.basename(p) != "learned.jsonl"]:
         n = datagen.write_dataset(os.path.join(data_dir, "chat.jsonl"), dataset_size)
         print(f"[data] generated starter dataset: {n} conversations -> {data_dir}/chat.jsonl")
-        jsonl = [os.path.join(data_dir, "chat.jsonl")]
+        jsonl = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
 
-    chats = []
+    chats, learned_chats = [], []
     for path in jsonl:
+        is_learned = os.path.basename(path) == "learned.jsonl"
         with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -49,26 +50,42 @@ def load_examples(data_dir: str, dataset_size: int):
                 system = next((m["content"] for m in msgs if m["role"] == "system"), datagen.SYSTEM)
                 turns = [m for m in msgs if m["role"] in ("user", "assistant")]
                 if turns and turns[-1]["role"] == "assistant":
-                    chats.append((system, turns))
+                    (learned_chats if is_learned else chats).append((system, turns))
 
-    raws = []
+    raws, learned_raws = [], []
     for path in sorted(glob.glob(os.path.join(data_dir, "*.txt"))):
         with open(path, encoding="utf-8") as f:
-            raws += [p.strip() for p in f.read().split("\n\n") if p.strip()]
-    print(f"[data] {len(chats)} conversations, {len(raws)} raw text paragraphs")
-    return chats, raws
+            paras = [p.strip() for p in f.read().split("\n\n") if p.strip()]
+        (learned_raws if os.path.basename(path) == "learned.txt" else raws).extend(paras)
+    print(f"[data] {len(chats)} conversations, {len(raws)} raw paragraphs | "
+          f"learned from the web: {len(learned_chats)} conversations, {len(learned_raws)} paragraphs")
+    return chats, raws, learned_chats, learned_raws
 
 
-def build_streams(tok, chats, raws, seed=0):
-    examples = []
-    for system, turns in chats:
-        examples.append(encode_chat(tok, turns, system))
-    for p in raws:
-        ids = [BOS] + tok.encode(p, special=False) + [EOS]
-        examples.append((ids, [1] * len(ids)))
-    random.Random(seed).shuffle(examples)
-    n_val = max(1, len(examples) // 33)
-    val, train = examples[:n_val], examples[n_val:]
+def build_streams(tok, chats, raws, seed=0, learned=((), ())):
+    """Pack examples into one token stream (+ loss mask). Web-learned data is oversampled
+    so it makes up roughly half of the tokens; otherwise a few hundred new examples would
+    be drowned out by the base set."""
+    def enc(chat_list, raw_list):
+        out = [encode_chat(tok, turns, system) for system, turns in chat_list]
+        for p in raw_list:
+            ids = [BOS] + tok.encode(p, special=False) + [EOS]
+            out.append((ids, [1] * len(ids)))
+        return out
+
+    base = enc(chats, raws)
+    random.Random(seed).shuffle(base)
+    n_val = max(1, len(base) // 33)
+    val, train = base[:n_val], base[n_val:]
+
+    extra = enc(*learned)
+    if extra:
+        base_tokens = sum(len(i) for i, _ in train)
+        extra_tokens = max(1, sum(len(i) for i, _ in extra))
+        rep = max(1, min(20, round(0.5 * base_tokens / extra_tokens)))
+        print(f"[data] web-learned data repeated x{rep} per epoch ({extra_tokens} tokens)")
+        train = train + extra * rep
+        random.Random(seed + 1).shuffle(train)
 
     def pack(exs):
         ids, mask = [], []
@@ -136,6 +153,7 @@ def main():
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--resume", action="store_true", help="continue training from --out")
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--no-demo", action="store_true", help="skip the quick test at the end")
     a = p.parse_args()
 
     torch.manual_seed(a.seed)
@@ -147,7 +165,7 @@ def main():
     batch = a.batch_size or (defaults[1] if device != "cpu" else min(defaults[1], 16))
     lr = a.lr or defaults[2]
 
-    chats, raws = load_examples(a.data_dir, a.dataset_size)
+    chats, raws, l_chats, l_raws = load_examples(a.data_dir, a.dataset_size)
 
     if a.resume and os.path.exists(a.out):
         ck = torch.load(a.out, map_location="cpu", weights_only=True)
@@ -158,7 +176,8 @@ def main():
     else:
         ck, start = None, 0
         print("[tokenizer] training byte-level BPE from scratch...")
-        texts = [datagen.SYSTEM] + [m["content"] for _, turns in chats for m in turns] + raws
+        texts = ([datagen.SYSTEM] + [m["content"] for _, turns in chats + l_chats for m in turns]
+                 + raws + l_raws)
         tok = BPETokenizer().train(texts, a.vocab_size)
         cfg = preset_config(preset, tok.vocab_size, a.block_size, a.dropout)
 
@@ -166,7 +185,7 @@ def main():
     if ck:
         model.load_state_dict(ck["model"])
     model.to(device).train()
-    train_s, val_s = build_streams(tok, chats, raws, a.seed)
+    train_s, val_s = build_streams(tok, chats, raws, a.seed, (l_chats, l_raws))
     if len(train_s[0]) <= cfg.block_size + 2:
         sys.exit("Not enough training data for this block size. Add more data to ./data")
 
@@ -190,7 +209,7 @@ def main():
     try:
         while step < start + steps:
             for g in opt.param_groups:
-                g["lr"] = lr_at(step - start, steps, lr)
+                g["lr"] = lr_at(step - start, steps, lr, warmup=min(100, max(10, steps // 10)))
             x, y = get_batch(train_s, cfg.block_size, batch, device)
             with torch.autocast(device_type="cuda" if use_amp else "cpu", dtype=amp_dtype, enabled=use_amp):
                 _, loss = model(x, y)[:2]
@@ -220,7 +239,8 @@ def main():
         save_ckpt(a.out, model, tok, meta)
 
     print(f"[done] {a.out} | {n_params / 1e6:.2f}M parameters | {step} steps | {time.time() - t0:.0f}s")
-    demo(a.out, device)
+    if not a.no_demo:
+        demo(a.out, device)
 
 
 def demo(path, device):

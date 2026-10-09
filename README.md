@@ -119,3 +119,53 @@ It answers capitals, definitions, Python snippets, Persian greetings and
 "Who are you?" incorrectly in English, and may greet with an invented name.
 These are data/training limits, not bugs: add more examples to `data/`, then
 train longer (`python train.py --resume --steps 3000`) or use `--preset small`.
+
+## Learn mode (web panel)
+
+Start the panel with learn mode switched on:
+
+    python app.py --web --learn          # or: run_web_learn.bat / ./run_web_learn.sh
+
+The terminal prints a link that ends in `#admin=<token>`. Open that exact link;
+a **Learn** button appears in the header. (The token stops other people, and other
+websites, from making your model fetch pages or retrain. Keep it private, or set
+your own with the `ORYVEX_ADMIN_TOKEN` environment variable.)
+
+In the Learn view you choose:
+
+1. **Sources**: Wikipedia in English and/or Persian (random articles or topics you
+   name) and, optionally, web pages you list yourself (follow links up to depth 2).
+2. **Training**: how many fine-tuning steps to run after collecting.
+
+It then collects text, turns every Wikipedia article into a chat example
+("Tell me about X" -> the article's opening sentences) plus raw text, fine-tunes
+the model in the background (live loss, progress bar, log), and hot-reloads the new
+weights without restarting. The previous model is backed up first; **Roll back**
+restores it.
+
+Same thing from the command line:
+
+    python learn.py --lang en fa --random 100 --train --steps 300
+    python learn.py --lang en --topics "Neural network" "Tehran" --train
+    python learn.py --urls https://example.com/article --consent
+
+How it behaves:
+- Polite: robots.txt is obeyed for web pages, requests are rate limited (about one per
+  second per site), it identifies itself, private/internal addresses are blocked,
+  pages over 2 MB are skipped. Set `ORYVEX_CONTACT` to your email or site so site
+  owners can reach you (Wikimedia asks for this).
+- Bounded: every run has page and depth caps. It does not, and cannot, "learn the
+  whole internet".
+- Filtering: only English/Persian text, paragraphs that look like emails or phone
+  numbers are dropped, duplicates are skipped, and `data/blocklist.txt` lets you list
+  words or domains to never learn from. This is basic filtering, not full moderation,
+  so review `data/learned.txt` if the content matters.
+- Licensing: Wikipedia text is CC BY-SA 4.0 (each example records its source). For
+  other sites, you are responsible for having the right to use the content.
+- Honest expectations: a ~4M-parameter model memorizes short summaries imperfectly
+  (it may garble words) and can forget older skills if you fine-tune too long. New
+  facts are oversampled during training so they stick; use Roll back if quality drops.
+  Real general knowledge needs a much bigger model plus far more data and a GPU.
+- Learn mode is OFF in the GitHub Actions workflow on purpose: that machine is
+  temporary and public, so anything learned would vanish and anyone with the link
+  could otherwise trigger it.

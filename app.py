@@ -71,6 +71,8 @@ def main():
     p.add_argument("--top-p", type=float, default=GenConfig.top_p)
     p.add_argument("--repetition-penalty", type=float, default=GenConfig.repetition_penalty)
     p.add_argument("--max-new-tokens", type=int, default=GenConfig.max_new_tokens)
+    p.add_argument("--learn", action="store_true",
+                   help="enable Learn mode in the web panel (collect web text + fine-tune). Needs an admin token.")
     p.add_argument("--system", default=None, help="override the system prompt (works best if it matches training)")
     a = p.parse_args()
 
@@ -80,7 +82,13 @@ def main():
     engine = OryvexEngine.load(a.ckpt, a.device, gen, a.system)
     if a.web:
         from server import run_web
-        run_web(engine, a.host, a.port, not a.no_browser)
+        learner = token = None
+        if a.learn:
+            import secrets
+            from learn import LearnManager
+            token = os.environ.get("ORYVEX_ADMIN_TOKEN") or secrets.token_urlsafe(16)
+            learner = LearnManager(ckpt=a.ckpt, engine=engine, device=engine.device)
+        run_web(engine, a.host, a.port, not a.no_browser, learner, token)
     else:
         run_cli(engine)
 

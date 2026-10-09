@@ -1,6 +1,7 @@
 """Web panel for OryvexAI: a tiny threaded HTTP server using only the standard library."""
 from __future__ import annotations
 
+import hmac
 import json
 import threading
 import uuid
@@ -40,6 +41,8 @@ def clean_sid(value) -> str:
 
 class WebHandler(BaseHTTPRequestHandler):
     engine: OryvexEngine = None  # set in run_web
+    learner = None               # LearnManager when learn mode is enabled
+    admin_token = None
     sessions = SessionStore()
     server_version = f"{BOT_NAME}/1.0"
 
@@ -58,6 +61,10 @@ class WebHandler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict):
         self._send(code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8")
 
+    def _admin_ok(self) -> bool:
+        given = self.headers.get("X-Admin-Token", "")
+        return bool(self.admin_token) and hmac.compare_digest(self.admin_token, given)
+
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0 or length > MAX_BODY_BYTES:
@@ -73,7 +80,13 @@ class WebHandler(BaseHTTPRequestHandler):
         if url.path in ("/", "/index.html"):
             self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif url.path == "/api/info":
-            self._json(200, self.engine.info())
+            self._json(200, {**self.engine.info(), "learn": self.learner is not None})
+        elif url.path == "/api/learn/status":
+            if self.learner is None:
+                return self._json(404, {"error": "Learn mode is off. Start with: python app.py --web --learn"})
+            if not self._admin_ok():
+                return self._json(403, {"error": "Bad or missing admin token."})
+            self._json(200, self.learner.status())
         elif url.path == "/api/history":
             sid = clean_sid(parse_qs(url.query).get("session", [""])[0])
             self._json(200, {"messages": self.sessions.get(sid).transcript})
@@ -88,6 +101,23 @@ class WebHandler(BaseHTTPRequestHandler):
             data = self._read_json()
         except Exception as exc:
             return self._json(400, {"error": str(exc)})
+
+        if url.path.startswith("/api/learn/"):
+            if self.learner is None:
+                return self._json(404, {"error": "Learn mode is off. Start with: python app.py --web --learn"})
+            if not self._admin_ok():
+                return self._json(403, {"error": "Bad or missing admin token."})
+            action = url.path.rsplit("/", 1)[-1]
+            if action == "start":
+                err = self.learner.start(data)
+                return self._json(400 if err else 200, {"error": err} if err else {"ok": True})
+            if action == "stop":
+                self.learner.stop()
+                return self._json(200, {"ok": True})
+            if action == "rollback":
+                err = self.learner.rollback()
+                return self._json(400 if err else 200, {"error": err} if err else {"ok": True})
+            return self._json(404, {"error": "Not found"})
 
         if url.path == "/api/reset":
             self.sessions.get(clean_sid(data.get("session"))).reset()
@@ -125,8 +155,11 @@ class WebHandler(BaseHTTPRequestHandler):
                 pass
 
 
-def run_web(engine: OryvexEngine, host: str, port: int, open_browser: bool):
+def run_web(engine: OryvexEngine, host: str, port: int, open_browser: bool,
+            learner=None, admin_token: str | None = None):
     WebHandler.engine = engine
+    WebHandler.learner = learner
+    WebHandler.admin_token = admin_token
     server = ThreadingHTTPServer((host, port), WebHandler)
     server.daemon_threads = True
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
@@ -134,6 +167,11 @@ def run_web(engine: OryvexEngine, host: str, port: int, open_browser: bool):
     print(f"\n[{BOT_NAME}] Web panel running at {url}   (Ctrl+C to stop)")
     if host in ("0.0.0.0", ""):
         print(f"[{BOT_NAME}] Listening on all interfaces: anyone on your network can use this panel.")
+    if learner is not None:
+        print(f"[{BOT_NAME}] LEARN MODE is ON. Open the panel with this link (it carries the admin token):")
+        print(f"[{BOT_NAME}]   {url}/#admin={admin_token}")
+        print(f"[{BOT_NAME}] Keep that token private: it lets whoever has it make the model fetch pages and retrain.")
+        url = f"{url}/#admin={admin_token}"
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:

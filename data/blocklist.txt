@@ -1,0 +1,2 @@
+# Optional: words or domains OryvexAI must never learn from (one per line, case-insensitive).
+# Paragraphs / articles containing any of these are skipped.
