@@ -219,7 +219,7 @@ def run_web(engine: OryvexEngine, host: str, port: int, open_browser: bool,
             learner=None, admin_token: str | None = None):
     WebHandler.engine = engine
     WebHandler.learner = learner
-    WebHandler.trainer = WikiTrainer()
+    WebHandler.trainer = WikiTrainer(engine=engine)
     WebHandler.admin_token = admin_token
     server = ThreadingHTTPServer((host, port), WebHandler)
     server.daemon_threads = True

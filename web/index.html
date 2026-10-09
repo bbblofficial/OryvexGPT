@@ -285,6 +285,11 @@ Large language model
         <div class="field" style="flex:1;min-width:220px">Your e-mail (optional, sent to Wikipedia in the User-Agent; Wikimedia gives identified users more room)<input id="tcontact" type="text" maxlength="100" placeholder="you@example.com" autocomplete="email"></div>
         <label class="check"><input id="tappend" type="checkbox" checked> Also add the new conversations to <code>data/chat.jsonl</code> (skips duplicates)</label>
       </div>
+      <div class="row">
+        <label class="check"><input id="ttrain" type="checkbox" checked> Then train the model on it and reload it (so it actually learns)</label>
+        <div class="field">Training steps<input id="tsteps" type="number" min="50" max="20000" value="1500"></div>
+      </div>
+      <div class="note">Training runs <code>train.py --resume</code> in the background and prints its output in the log below. The old model is backed up as <code>oryvex.prev.pt</code>. On a CPU, 1500 steps can take a while; the log shows the time left.</div>
       <div class="note">Pipeline: search &rarr; fetch HTML &rarr; clean &rarr; chunk &rarr; generate Q&amp;A &rarr; convert to chat.jsonl. Wikipedia text is CC BY-SA 4.0.</div>
     </div>
 
@@ -305,6 +310,9 @@ Large language model
         <div class="stat"><b id="tCh">0</b><span>chunks</span></div>
         <div class="stat"><b id="tQa">0</b><span>Q&amp;A pairs</span></div>
         <div class="stat"><b id="tRec">0</b><span>chat.jsonl lines</span></div>
+        <div class="stat"><b id="tLoss">-</b><span>train loss</span></div>
+        <div class="stat"><b id="tVal">-</b><span>validation loss</span></div>
+        <div class="stat"><b id="tEta">-</b><span>minutes left</span></div>
       </div>
       <div class="note" id="tsrc"></div>
     </div>
@@ -567,7 +575,7 @@ $('#lroll').onclick = async () => {
 
 /* ---- Training page (Wikipedia -> chat.jsonl) ---- */
 const PHASES = {idle:'idle', searching:'1/6 searching', fetching:'2/6 fetching', cleaning:'3/6 cleaning',
-  chunking:'4/6 chunking', generating:'5/6 generating Q&A', converting:'6/6 converting', done:'done', error:'error', stopped:'stopped'};
+  chunking:'4/6 chunking', generating:'5/6 generating Q&A', converting:'6/6 converting', training:'7/7 training model', reloading:'reloading model', done:'done', error:'error', stopped:'stopped'};
 let lastLogId = 0;
 function addLogLine(e){
   const box = $('#tlog');
@@ -585,8 +593,9 @@ function renderTrain(s){
   ph.textContent = PHASES[s.phase] || s.phase;
   ph.className = 'pill' + (s.running ? ' live' : s.phase === 'error' ? ' bad' : '');
   $('#tbar').style.width = Math.round((s.progress || 0) * 100) + '%';
-  $('#tStep').textContent = (s.topics > 1 ? 'topic ' + (s.topic_n || 0) + '/' + s.topics + ' · ' : '') + (s.step || 0) + '/6';
+  $('#tStep').textContent = (s.topics > 1 ? 'topic ' + (s.topic_n || 0) + '/' + s.topics + ' · ' : '') + (s.step || 0) + '/' + (s.steps || 6);
   $('#tPar').textContent = s.paragraphs || 0; $('#tCh').textContent = s.chunks || 0;
+  $('#tLoss').textContent = s.loss == null ? '-' : s.loss.toFixed(3); $('#tVal').textContent = s.val_loss == null ? '-' : s.val_loss.toFixed(3); $('#tEta').textContent = s.phase === 'training' && s.eta_min != null ? s.eta_min.toFixed(1) : '-';
   $('#tQa').textContent = s.pairs || 0; $('#tRec').textContent = s.records || 0;
   $('#tmsg').textContent = s.title ? 'Article: ' + s.title : '';
   const src = $('#tsrc'); src.textContent = '';
@@ -632,7 +641,7 @@ function closeTrain(){ clearTimeout(trainPoll); }
 $('#tstart').onclick = async () => {
   $('#terr').textContent = '';
   try {
-    await tapi('/api/train/start', {topics: $('#ttopic').value, contact: $('#tcontact').value.trim(), append: $('#tappend').checked,
+    await tapi('/api/train/start', {topics: $('#ttopic').value, contact: $('#tcontact').value.trim(), append: $('#tappend').checked, train: $('#ttrain').checked, steps: +$('#tsteps').value,
       max_pairs: +$('#tpairs').value, chunk_size: +$('#tchunk').value});
     lastLogId = 0; $('#tlog').textContent = ''; $('#tlog').dataset.empty = '0';
     openTrain();

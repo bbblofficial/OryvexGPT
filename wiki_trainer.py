@@ -44,6 +44,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import signal
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -261,6 +265,8 @@ Q_TEMPLATES = {
         "year": ["What happened in {y} in relation to {t}?", "What is notable about {y} for {t}?",
                  "What do you know about {t} in {y}?"],
         "thing": ["What is {x}?", "Can you explain what {x} is?", "Define {x}."],
+        "more": ["Tell me more about {t} (part {n}).", "What else should I know about {t} (part {n})?",
+                 "Give me more background on {t} (part {n})."],
     },
     "fa": {
         "define": ["{t} چیست؟", "{t} کیست یا چیست؟", "می‌شه {t} رو تعریف کنی؟"],
@@ -268,6 +274,7 @@ Q_TEMPLATES = {
         "section": ["درباره {s} در موضوع {t} توضیح بده.", "در مورد {s} در {t} چه می‌دانی؟"],
         "year": ["در سال {y} چه اتفاقی برای {t} افتاد؟", "درباره {t} در سال {y} چه می‌دانی؟"],
         "thing": ["{x} چیست؟"],
+        "more": ["بیشتر درباره {t} بگو (بخش {n}).", "چه نکته دیگری درباره {t} باید بدانم (بخش {n})؟"],
     },
 }
 _YEAR = re.compile(r"(?<!\d)(1[0-9]{3}|20[0-4][0-9])(?!\d|s\b|')")
@@ -320,11 +327,13 @@ def generate_pairs(title: str, chunks: list[dict], lang: str, max_pairs: int,
         text, sec = ch["text"], ch["section"]
         sentences = split_sentences(text)
         key = f"{title}|{i}"
-        if i == 0 or not sec:  # lead of the article
+        if i == 0:  # first chunk = the article's opening: definition + overview
             short = summary_answer(text)
             if short:
                 add("define", _pick(T["define"], key + "d").format(t=title), short)
             add("overview", _pick(T["overview"], key + "o").format(t=title), _trim(text, 700))
+        elif not sec:  # later chunks of the unnamed lead: must NOT reuse the definition questions
+            add("more", _pick(T["more"], key + "m").format(t=title, n=i + 1), _trim(text, 700))
         else:
             add("section", _pick(T["section"], key + "s").format(s=sec, t=title), _trim(text, 700))
 
@@ -382,8 +391,13 @@ def validate_record(rec) -> bool:
 class WikiTrainer:
     """Runs the pipeline in a background thread; the web panel polls / streams its state."""
 
-    def __init__(self, data_dir: str = "data"):
-        self.data_dir = Path(data_dir)
+    def __init__(self, data_dir: str | None = None, engine=None, ckpt: str | None = None):
+        root = Path(__file__).resolve().parent
+        self.root = root
+        self.data_dir = Path(data_dir) if data_dir else root / "data"
+        self.ckpt = Path(ckpt) if ckpt else root / "checkpoints" / "oryvex.pt"
+        self.engine = engine               # live model: hot-reloaded after training
+        self.proc: subprocess.Popen | None = None
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
         self.thread: threading.Thread | None = None
@@ -395,7 +409,8 @@ class WikiTrainer:
 
     @staticmethod
     def _fresh() -> dict:
-        return {"phase": "idle", "step": 0, "steps": 6, "topic": "", "lang": "en", "title": "",
+        return {"phase": "idle", "step": 0, "steps": 6, "train_step": 0, "train_total": 0,
+                "loss": None, "val_loss": None, "eta_min": None, "topic": "", "lang": "en", "title": "",
                 "url": "", "topic_n": 0, "topics": 1, "progress": 0.0, "chunks": 0, "paragraphs": 0, "removed": 0,
                 "pairs": 0, "format": "chat.jsonl", "ready": False}
 
@@ -463,6 +478,7 @@ class WikiTrainer:
         if contact and not re.fullmatch(r"[\w.+-]+@[\w-]+\.[\w.-]+|https?://\S+", contact):
             return "Contact must be an e-mail address or a website URL (or leave it empty)."
         return {"topics": topics, "contact": contact, "append": bool(o.get("append", True)),
+                "train": bool(o.get("train", True)), "steps": clamp(o.get("steps", 1500), 50, 20000, 1500),
                 "max_pairs": clamp(o.get("max_pairs", 60), 5, 400, 60),   # per topic
                 "chunk_size": clamp(o.get("chunk_size", 700), 300, 1500, 700)}
 
@@ -476,13 +492,19 @@ class WikiTrainer:
             self.stop_event.clear()
             self.logs.clear()
             self.state = {**self._fresh(), "phase": "searching", "topic": ", ".join(o["topics"]), "lang": "auto",
-                          "topic_n": 0, "topics": len(o["topics"])}
+                          "topic_n": 0, "topics": len(o["topics"]), "steps": 7 if o["train"] else 6}
             self.thread = threading.Thread(target=self._run, args=(o,), daemon=True)
             self.thread.start()
         return None
 
     def stop(self):
         self.stop_event.set()
+        p = self.proc
+        if p and p.poll() is None:  # ask train.py to save what it has and exit
+            try:
+                p.send_signal(signal.SIGINT if os.name == "posix" else signal.SIGTERM)
+            except Exception:
+                pass
 
     def clear(self) -> str | None:
         with self.lock:
@@ -617,9 +639,8 @@ class WikiTrainer:
         self._log("Pair types: " + (", ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "none"))
         return pairs
 
-    def _append_to_dataset(self, records: list[dict]):
-        """Add the new conversations to data/chat.jsonl, skipping questions that are already there."""
-        path = self.data_dir / "chat.jsonl"
+    def _append_jsonl(self, path: Path, records: list[dict]) -> int:
+        """Append records to a chat .jsonl file, skipping questions that are already in it."""
         known: set[str] = set()
         needs_nl = False
         if path.exists():
@@ -637,14 +658,65 @@ class WikiTrainer:
             if q not in known:
                 known.add(q)
                 new.append(r)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             if needs_nl:
                 f.write("\n")
             for r in new:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        self._log(f"Appended {len(new)} new conversation(s) to {path.as_posix()} "
+        self._log(f"Appended {len(new)} new conversation(s) to {path.name} "
                   f"({len(records) - len(new)} duplicate(s) skipped).", "ok")
+        return len(new)
+
+    def _train_model(self, o: dict):
+        """Step 7: fine-tune the model on the data (train.py --resume) and stream its output live."""
+        steps = o["steps"]
+        self._set(phase="training", step=7, progress=0.0, train_step=0, train_total=steps)
+        self._log(f"[7/7] Training the model on the new data ({steps} steps, resuming {self.ckpt.name})...", "step")
+        if not self.ckpt.exists():
+            raise FileNotFoundError(f"No model at {self.ckpt}. Train one first: python train.py")
+        shutil.copy2(self.ckpt, self.ckpt.with_suffix(".prev.pt"))   # backup, so the Learn page can roll back
+        cmd = [sys.executable, "-u", str(self.root / "train.py"), "--resume", "--steps", str(steps),
+               "--batch-size", "16", "--lr", "5e-4", "--eval-every", str(max(50, steps // 4)),
+               "--out", str(self.ckpt), "--data-dir", str(self.data_dir), "--no-demo"]
+        dev = getattr(self.engine, "device", None)
+        if dev and dev != "auto":
+            cmd += ["--device", str(dev)]
+        self.proc = subprocess.Popen(cmd, cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1, encoding="utf-8", errors="replace")
+        step_re = re.compile(r"step\s+(\d+)/(\d+)\s*\|\s*loss\s+([\d.]+).*?eta\s+([\d.]+)")
+        val_re = re.compile(r"validation loss\s+([\d.]+)")
+        tail: list[str] = []
+        for line in self.proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            tail = (tail + [line])[-6:]
+            m, v = step_re.search(line), val_re.search(line)
+            if m:
+                done, total = int(m.group(1)), int(m.group(2))
+                done = max(0, done - (total - steps))
+                self._set(train_step=done, loss=float(m.group(3)), eta_min=float(m.group(4)),
+                          progress=min(1.0, done / steps))
+            if v:
+                self._set(val_loss=float(v.group(1)))
+            self._log("train> " + line, "info")
+        rc = self.proc.wait()
+        self.proc = None
+        if rc != 0 and not self.stop_event.is_set():
+            raise RuntimeError("Training failed: " + " | ".join(tail[-3:]))
+        self._set(phase="reloading")
+        if self.engine is not None:
+            self._log("Loading the new weights into the running chat...")
+            self.engine.reload(str(self.ckpt))
+            self._log("Done. The chat page now uses the updated model.", "ok")
+        else:
+            self._log("Restart the server to use the new weights.", "warn")
+        if self.stop_event.is_set():
+            self._set(phase="stopped")
+            self._log("Stopped. The latest saved checkpoint is live.", "warn")
+        else:
+            self._set(phase="done", progress=1.0)
 
     def _run(self, o: dict):
         topics, n = o["topics"], len(o["topics"])
@@ -688,15 +760,21 @@ class WikiTrainer:
                 raise ValueError(f"{len(bad)} record(s) failed chat.jsonl validation.")
             with self.cond:
                 self.records = records
-                self.state.update(phase="done", step=6, progress=1.0, pairs=len(records), ready=True)
+                self.state.update(phase="done" if not o["train"] else "converting", step=6, progress=1.0,
+                                  pairs=len(records), ready=True)
                 self.cond.notify_all()
             size = len(self.chat_jsonl().encode("utf-8"))
             self._log(f"State set to chat.jsonl: {len(records)} valid conversation(s) from {n - failed}/{n} topic(s), "
                       f"{size:,} bytes. Ready to download.", "ok")
             if o["append"]:
-                self._append_to_dataset(records)
+                self._append_jsonl(self.data_dir / "chat.jsonl", records)
+            if o["train"]:
+                # learned.jsonl is oversampled by train.py, so a few hundred new examples are not drowned out
+                self._append_jsonl(self.data_dir / "learned.jsonl", records)
             if failed:
                 self._log(f"{failed} topic(s) failed. Run them again later (duplicates are skipped when appending).", "warn")
+            if o["train"]:
+                self._train_model(o)
         except Exception as e:  # keep the panel alive whatever happens
             self._set(phase="error")
             self._log(f"Error: {e}", "error")
