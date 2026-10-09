@@ -1,0 +1,63 @@
+name: Host OryvexAI (trycloudflare test)
+
+# Runs the web panel on a GitHub Actions runner and exposes it through a free
+# Cloudflare quick tunnel (https://<random>.trycloudflare.com).
+# Start it from the "Actions" tab -> "Host OryvexAI" -> "Run workflow".
+# The public URL is printed in the job log and in the job summary.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to keep the site online (max 330)"
+        default: "60"
+        required: true
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU-only PyTorch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Check the trained model exists
+        run: |
+          test -f checkpoints/oryvex.pt || { echo "checkpoints/oryvex.pt is missing. Train with train.py and commit it."; exit 1; }
+
+      - name: Start OryvexAI web panel
+        run: |
+          nohup python app.py --web --no-browser --host 127.0.0.1 --port 8000 --device cpu > app.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fs http://127.0.0.1:8000/api/info && break
+            sleep 2
+          done
+          curl -fs http://127.0.0.1:8000/api/info || { cat app.log; exit 1; }
+
+      - name: Start Cloudflare quick tunnel
+        run: |
+          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000 > tunnel.log 2>&1 &
+          for i in $(seq 1 45); do
+            URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' tunnel.log | head -n1)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          [ -n "$URL" ] || { cat tunnel.log; exit 1; }
+          echo "OryvexAI is live at: $URL"
+          echo "### OryvexAI is live" >> "$GITHUB_STEP_SUMMARY"
+          echo "$URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "(online for ${{ inputs.minutes }} minutes; anyone with this link can use it)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep online
+        run: |
+          MIN=${{ inputs.minutes }}
+          [ "$MIN" -gt 330 ] && MIN=330
+          echo "Staying online for $MIN minutes..."
+          sleep $((MIN * 60))

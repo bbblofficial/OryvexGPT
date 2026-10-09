@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OryvexAI</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%234a3ee0'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='white' stroke-width='3'/%3E%3Cpath d='M21 11 11 21' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#eceff6; --surface:#ffffff; --ink:#171a33; --muted:#646a87; --line:#d9dded;
+    --accent:#4a3ee0; --accent-ink:#ffffff; --user:#4a3ee0; --user-ink:#ffffff;
+    --code:#f2f3fa; --ok:#1fa971; --danger:#c8344a;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#12131f; --surface:#1a1c2e; --ink:#e8e9f5; --muted:#9a9fbe; --line:#2b2e47;
+      --accent:#8b82ff; --accent-ink:#12131f; --user:#38358f; --user-ink:#f1f0ff;
+      --code:#232640; --ok:#43d19b; --danger:#ff7088;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#12131f; --surface:#1a1c2e; --ink:#e8e9f5; --muted:#9a9fbe; --line:#2b2e47;
+    --accent:#8b82ff; --accent-ink:#12131f; --user:#38358f; --user-ink:#f1f0ff;
+    --code:#232640; --ok:#43d19b; --danger:#ff7088;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:16px/1.55 "Avenir Next","Segoe UI",system-ui,-apple-system,Roboto,sans-serif;
+    display:flex; flex-direction:column;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  button{font:inherit;color:inherit;cursor:pointer}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  header{
+    display:flex; align-items:center; gap:14px; padding:12px 20px;
+    background:var(--surface); border-bottom:1px solid var(--line);
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;letter-spacing:-.01em}
+  .brand svg{flex:none}
+  .chip{
+    display:flex;align-items:center;gap:8px;margin-left:auto;
+    font-size:13px;color:var(--muted);min-width:0;
+  }
+  .chip i{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none}
+  .chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .btn{
+    border:1px solid var(--line);background:transparent;border-radius:10px;
+    padding:7px 14px;font-size:14px;flex:none;
+  }
+  .btn:hover{border-color:var(--accent)}
+
+  main{flex:1;overflow-y:auto;scroll-behavior:smooth}
+  .col{max-width:780px;margin:0 auto;padding:28px 20px 12px;display:flex;flex-direction:column;gap:22px}
+
+  .empty{padding:9vh 0 0}
+  .empty h1{font-size:clamp(28px,5vw,40px);line-height:1.1;margin:0 0 10px;letter-spacing:-.03em}
+  .empty p{margin:0 0 26px;color:var(--muted);max-width:46ch}
+  .starters{display:flex;flex-direction:column;gap:10px;align-items:flex-start}
+  .starters button{
+    background:var(--surface);border:1px solid var(--line);border-radius:12px;
+    padding:10px 16px;text-align:left;
+  }
+  .starters button:hover{border-color:var(--accent)}
+
+  .msg{display:flex;gap:12px;min-width:0}
+  .msg.user{justify-content:flex-end}
+  .msg.user .body{
+    background:var(--user);color:var(--user-ink);border-radius:18px 18px 4px 18px;
+    padding:10px 16px;max-width:85%;white-space:pre-wrap;overflow-wrap:anywhere;
+  }
+  .msg.bot .avatar{
+    width:30px;height:30px;border-radius:9px;background:var(--accent);flex:none;
+    display:grid;place-items:center;margin-top:2px;
+  }
+  .msg.bot .body{flex:1;min-width:0;overflow-wrap:anywhere;white-space:pre-wrap}
+  .msg.bot .body.err{color:var(--danger)}
+  .tools{margin-top:6px;display:flex;gap:10px}
+  .tools button{
+    background:none;border:0;padding:0;font-size:13px;color:var(--muted);
+  }
+  .tools button:hover{color:var(--accent)}
+  code{background:var(--code);border-radius:5px;padding:1px 5px;font:13.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  pre{
+    background:var(--code);border:1px solid var(--line);border-radius:10px;margin:10px 0;
+    padding:12px 14px;overflow-x:auto;white-space:pre;
+  }
+  pre code{background:none;padding:0}
+
+  .dots{display:inline-flex;gap:5px;padding:9px 0}
+  .dots b{width:7px;height:7px;border-radius:50%;background:var(--muted);animation:blink 1.1s infinite ease-in-out}
+  .dots b:nth-child(2){animation-delay:.15s}
+  .dots b:nth-child(3){animation-delay:.3s}
+  @keyframes blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
+  @media (prefers-reduced-motion: reduce){.dots b{animation:none;opacity:.6} main{scroll-behavior:auto}}
+
+  footer{padding:10px 20px 18px;background:linear-gradient(to top,var(--bg) 70%,transparent)}
+  .composer{
+    max-width:780px;margin:0 auto;display:flex;align-items:flex-end;gap:10px;
+    background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:8px 8px 8px 16px;
+  }
+  .composer:focus-within{border-color:var(--accent)}
+  textarea{
+    flex:1;border:0;outline:0;resize:none;background:transparent;color:inherit;
+    font:inherit;max-height:180px;padding:7px 0;
+  }
+  textarea::placeholder{color:var(--muted)}
+  .send{
+    background:var(--accent);color:var(--accent-ink);border:0;border-radius:11px;
+    padding:9px 18px;font-weight:600;flex:none;
+  }
+  .send:disabled{opacity:.45;cursor:not-allowed}
+  .send.stop{background:var(--danger);color:#fff}
+  .hint{max-width:780px;margin:8px auto 0;font-size:12.5px;color:var(--muted);text-align:center}
+
+  @media (max-width:560px){
+    .chip span{display:none}
+    header{padding:10px 14px}
+    .col{padding:20px 14px 8px}
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true">
+      <rect width="32" height="32" rx="9" fill="var(--accent)"/>
+      <circle cx="16" cy="16" r="7" fill="none" stroke="var(--accent-ink)" stroke-width="3"/>
+      <path d="M21 11 11 21" stroke="var(--accent-ink)" stroke-width="3" stroke-linecap="round"/>
+    </svg>
+    OryvexAI
+  </div>
+  <div class="chip" title="Running locally"><i></i><span id="status">Loading…</span></div>
+  <button class="btn" id="theme" type="button" aria-label="Toggle theme">Theme</button>
+  <button class="btn" id="new" type="button">New chat</button>
+</header>
+
+<main id="scroll"><div class="col" id="log"></div></main>
+
+<footer>
+  <div class="composer">
+    <textarea id="input" dir="auto" rows="1" placeholder="Message OryvexAI" aria-label="Message"></textarea>
+    <button class="send" id="send" type="button">Send</button>
+  </div>
+  <div class="hint">Enter to send, Shift+Enter for a new line. Everything runs on your machine.</div>
+</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = $('#log'), input = $('#input'), sendBtn = $('#send'), scroller = $('#scroll');
+const AVATAR = '<svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="7" fill="none" stroke="var(--accent-ink)" stroke-width="3.5"/><path d="M21 11 11 21" stroke="var(--accent-ink)" stroke-width="3.5" stroke-linecap="round"/></svg>';
+const STARTERS = [
+  'Who are you?',
+  'What is a neural network?',
+  'Write a Python function to reverse a string.'
+];
+
+let sid = localStorage.getItem('oryvex_sid');
+if (!sid) {
+  sid = (window.crypto && crypto.randomUUID) ? crypto.randomUUID().replace(/-/g,'') :
+        (Date.now().toString(36) + Math.random().toString(36).slice(2));
+  localStorage.setItem('oryvex_sid', sid);
+}
+let busy = false, controller = null;
+
+/* ---- theme ---- */
+const savedTheme = localStorage.getItem('oryvex_theme');
+if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+$('#theme').onclick = () => {
+  const dark = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#12131f';
+  const next = dark ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('oryvex_theme', next);
+};
+
+/* ---- rendering ---- */
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function md(text){
+  return esc(text).split('```').map((part, i) => {
+    if (i % 2) return '<pre><code>' + part.replace(/^[\w+#.-]*\n/, '') + '</code></pre>';
+    return part.replace(/`([^`\n]+)`/g, '<code>$1</code>')
+               .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  }).join('');
+}
+function scrollDown(){ scroller.scrollTop = scroller.scrollHeight; }
+
+function addMsg(role, text){
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + (role === 'user' ? 'user' : 'bot');
+  const body = document.createElement('div');
+  body.className = 'body'; body.dir = 'auto';
+  if (role === 'user') {
+    body.textContent = text;
+  } else {
+    const av = document.createElement('div');
+    av.className = 'avatar'; av.innerHTML = AVATAR;
+    wrap.appendChild(av);
+    body.innerHTML = md(text);
+  }
+  wrap.appendChild(body);
+  log.appendChild(wrap);
+  scrollDown();
+  return body;
+}
+function addTools(body){
+  const bar = document.createElement('div');
+  bar.className = 'tools';
+  const copy = document.createElement('button');
+  copy.type = 'button'; copy.textContent = 'Copy';
+  copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(body.dataset.raw || body.textContent); copy.textContent = 'Copied'; }
+    catch { copy.textContent = 'Copy failed'; }
+    setTimeout(() => copy.textContent = 'Copy', 1400);
+  };
+  bar.appendChild(copy);
+  body.appendChild(bar);
+}
+function showEmpty(){
+  log.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'empty';
+  box.innerHTML = '<h1>What are we working on?</h1><p>A small language model trained from scratch. It runs on this computer and remembers the chat until you start a new one.</p>';
+  const list = document.createElement('div'); list.className = 'starters';
+  STARTERS.forEach(t => {
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = t;
+    b.onclick = () => send(t);
+    list.appendChild(b);
+  });
+  box.appendChild(list); log.appendChild(box);
+}
+
+/* ---- chat ---- */
+function setBusy(v){
+  busy = v;
+  sendBtn.textContent = v ? 'Stop' : 'Send';
+  sendBtn.classList.toggle('stop', v);
+}
+
+async function send(text){
+  text = (text || '').trim();
+  if (busy || !text) return;
+  const empty = log.querySelector('.empty'); if (empty) empty.remove();
+  input.value = ''; autosize();
+  addMsg('user', text);
+  const body = addMsg('bot', '');
+  body.innerHTML = '<span class="dots"><b></b><b></b><b></b></span>';
+  controller = new AbortController();
+  setBusy(true);
+  let acc = '';
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session: sid, message: text}), signal: controller.signal
+    });
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      acc += dec.decode(value, {stream: true});
+      body.innerHTML = md(acc);
+      scrollDown();
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      body.classList.add('err');
+      acc = acc || ('Could not reach the model: ' + e.message);
+      body.textContent = acc;
+    }
+  }
+  if (!acc) { body.innerHTML = '<em style="color:var(--muted)">Stopped.</em>'; }
+  else { body.dataset.raw = acc; if (!body.classList.contains('err')) { body.innerHTML = md(acc); addTools(body); } }
+  setBusy(false); controller = null; input.focus();
+}
+
+function autosize(){ input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 180) + 'px'; }
+input.addEventListener('input', autosize);
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(input.value); }
+});
+sendBtn.onclick = () => busy ? controller && controller.abort() : send(input.value);
+
+$('#new').onclick = async () => {
+  if (controller) controller.abort();
+  try { await fetch('/api/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session: sid})}); } catch {}
+  showEmpty(); input.focus();
+};
+
+/* ---- boot ---- */
+(async function init(){
+  try {
+    const info = await (await fetch('/api/info')).json();
+    $('#status').textContent = info.model.split('/').pop() + ' · ' + info.device;
+  } catch { $('#status').textContent = 'Offline'; }
+  try {
+    const h = await (await fetch('/api/history?session=' + encodeURIComponent(sid))).json();
+    if (h.messages && h.messages.length) {
+      h.messages.forEach(m => { const b = addMsg(m.role === 'user' ? 'user' : 'bot', m.content); if (m.role !== 'user') { b.dataset.raw = m.content; addTools(b); } });
+    } else showEmpty();
+  } catch { showEmpty(); }
+  input.focus();
+})();
+</script>
+</body>
+</html>
