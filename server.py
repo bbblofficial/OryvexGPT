@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import hmac
 import json
+import tempfile
 import threading
+import time
 import uuid
 import webbrowser
+import zipfile
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,6 +20,62 @@ from wiki_trainer import WikiTrainer
 MAX_BODY_BYTES = 1_000_000
 MAX_WEB_SESSIONS = 100
 INDEX_HTML = (Path(__file__).parent / "web" / "index.html").read_text(encoding="utf-8")
+
+ROOT = Path(__file__).resolve().parent
+MODEL_DIRS = ("checkpoints", "data")   # everything that makes up "the model": weights, tokenizer, training data
+SKIP_SUFFIXES = (".tmp", ".pyc", ".log")
+
+RESTORE_TXT = """OryvexAI model backup
+=====================
+Created: {when}
+
+This zip keeps the same folder layout as the project, so restoring is simple:
+
+  1. Unzip it.
+  2. Copy the 'checkpoints' and 'data' folders into the root of your OryvexAI project
+     (or upload them to your GitHub repository, replacing the old ones).
+  3. Start the panel (run_web or the GitHub workflow). It loads checkpoints/oryvex.pt.
+
+Files:
+{files}
+
+Notes:
+  - checkpoints/oryvex.pt      the model (weights + tokenizer + config), this is the important one
+  - checkpoints/oryvex.prev.pt the previous model (backup made before the last training), optional
+  - data/chat.jsonl            training conversations
+  - data/learned.jsonl         conversations learned from Wikipedia (repeated more often during training)
+GitHub rejects single files above 100 MB; this model is far below that.
+"""
+
+
+def model_files() -> list[Path]:
+    out = []
+    for d in MODEL_DIRS:
+        base = ROOT / d
+        if base.is_dir():
+            for p in sorted(base.rglob("*")):
+                if p.is_file() and not p.name.endswith(SKIP_SUFFIXES) and "__pycache__" not in p.parts:
+                    out.append(p)
+    return out
+
+
+def build_model_zip():
+    """Zip checkpoints/ and data/ into a temp file. Returns (file object, size, download name)."""
+    files = model_files()
+    if not any(p.suffix == ".pt" for p in files):
+        raise FileNotFoundError("No model found yet (checkpoints/oryvex.pt is missing).")
+    when = time.strftime("%Y-%m-%d %H:%M:%S")
+    tmp = tempfile.TemporaryFile(prefix="oryvex-model-")
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        listing = []
+        for p in files:
+            rel = p.relative_to(ROOT).as_posix()
+            z.write(p, rel)   # checkpoints are written atomically (tmp + replace), so this is a consistent copy
+            listing.append(f"  {rel}  ({p.stat().st_size / 1024:,.0f} KB)")
+        z.writestr("RESTORE.txt", RESTORE_TXT.format(when=when, files="\n".join(listing)))
+    size = tmp.tell()
+    tmp.seek(0)
+    return tmp, size, f"oryvex-model-{time.strftime('%Y%m%d-%H%M')}.zip"
 
 
 class SessionStore:
@@ -134,6 +193,33 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+        elif url.path == "/api/model/info":
+            files = model_files()
+            self._json(200, {"files": [{"path": p.relative_to(ROOT).as_posix(), "bytes": p.stat().st_size} for p in files],
+                             "has_model": any(p.suffix == ".pt" for p in files)})
+        elif url.path == "/api/model/download":
+            try:
+                fh, size, name = build_model_zip()
+            except FileNotFoundError as exc:
+                return self._json(404, {"error": str(exc)})
+            except Exception as exc:
+                return self._json(500, {"error": f"Could not build the zip: {exc}"})
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+            finally:
+                fh.close()
         elif url.path == "/api/history":
             sid = clean_sid(parse_qs(url.query).get("session", [""])[0])
             self._json(200, {"messages": self.sessions.get(sid).transcript})

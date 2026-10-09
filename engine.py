@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import codecs
 import threading
+import time
+from pathlib import Path
 from dataclasses import dataclass, field
 
 import torch
 
+from memory import LearnedMemory
 from model import GPTConfig, OryvexGPT
 from tokenizer import BPETokenizer, encode_chat, EOS, BYTE_OFFSET, PAD, BOS, SYSTEM, USER, ASSISTANT
 
@@ -55,6 +58,11 @@ class OryvexEngine:
         self.meta = meta or {}
         self.lock = threading.Lock()  # one generation at a time
         self.block = model.cfg.block_size
+        self.use_memory = True   # answer learned questions from data/learned.jsonl (see memory.py)
+        self.memory = LearnedMemory(Path(__file__).resolve().parent / "data" / "learned.jsonl")
+
+    def reload_memory(self):
+        self.memory.load()
 
     @classmethod
     def load(cls, path: str = DEFAULT_CKPT, device: str = "auto", gen: GenConfig | None = None,
@@ -78,6 +86,7 @@ class OryvexEngine:
         with self.lock:  # waits for any reply in progress
             self.model, self.tok, self.block = model, tok, model.cfg.block_size
             self.meta, self.ckpt_path = ckpt.get("meta", {}), path
+        self.reload_memory()
 
     # ------------------------------------------------------------- prompt
     def _build_ids(self, session: ChatSession) -> list[int]:
@@ -148,6 +157,16 @@ class OryvexEngine:
             session.transcript.append(dict(user_msg))
             parts: list[str] = []
             try:
+                hit = self.memory.lookup(user_text) if self.use_memory and len(self.memory) else None
+                if hit:   # learned answer: send it as a stream so the page behaves the same
+                    text = hit[0]
+                    for i in range(0, len(text), 16):
+                        if cancel.is_set():
+                            break
+                        parts.append(text[i:i + 16])
+                        yield text[i:i + 16]
+                        time.sleep(0.004)
+                    return
                 ids = self._build_ids(session)
                 dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
                 for t in self._generate(ids, cancel):
@@ -182,4 +201,5 @@ class OryvexEngine:
             "context": self.block,
             "steps": self.meta.get("steps"),
             "val_loss": self.meta.get("val_loss"),
+            "memory": len(self.memory),
         }

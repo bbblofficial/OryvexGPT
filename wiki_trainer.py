@@ -768,9 +768,12 @@ class WikiTrainer:
                       f"{size:,} bytes. Ready to download.", "ok")
             if o["append"]:
                 self._append_jsonl(self.data_dir / "chat.jsonl", records)
-            if o["train"]:
+            if o["train"] or o["append"]:
                 # learned.jsonl is oversampled by train.py, so a few hundred new examples are not drowned out
                 self._append_jsonl(self.data_dir / "learned.jsonl", records)
+                if self.engine is not None:
+                    self.engine.reload_memory()
+                    self._log(f"Memory updated: {len(self.engine.memory)} learned Q&A pairs can now be answered word for word.", "ok")
             if failed:
                 self._log(f"{failed} topic(s) failed. Run them again later (duplicates are skipped when appending).", "warn")
             if o["train"]:
