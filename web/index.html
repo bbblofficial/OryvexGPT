@@ -262,15 +262,23 @@
   <div class="col">
     <div>
       <h2>Training from Wikipedia</h2>
-      <p class="lead">Type a topic. The panel searches Wikipedia, downloads the article, cleans it, splits it into chunks and writes synthetic question-answer pairs. The result is kept as <code>chat.jsonl</code> that you can download.</p>
+      <p class="lead">Type one or more topics (it starts with AI topics already filled in). For each one, the panel searches Wikipedia, downloads the article, cleans it, splits it into chunks and writes synthetic question-answer pairs. The result is kept as <code>chat.jsonl</code> that you can download.</p>
     </div>
 
     <div class="card">
       <h3>1. Topic</h3>
       <div class="row">
-        <div class="field" style="flex:1;min-width:220px">Topic<input id="ttopic" dir="auto" type="text" maxlength="120" placeholder="e.g. Neural network, Tehran, فتوسنتز" autocomplete="off"></div>
-        <div class="field">Language<select id="tlang"><option value="en">English</option><option value="fa">Persian</option></select></div>
-        <div class="field">Max Q&amp;A pairs<input id="tpairs" type="number" min="5" max="400" value="60"></div>
+        <div class="field" style="flex:1;min-width:220px">Topics (English or Persian, language is detected automatically; one per line, up to 20)<textarea id="ttopic" dir="auto" rows="8" placeholder="Artificial intelligence&#10;Machine learning&#10;Neural network">Artificial intelligence
+Machine learning
+Deep learning
+Neural network
+Natural language processing
+Large language model
+هوش مصنوعی
+یادگیری ماشین
+شبکه عصبی مصنوعی
+پردازش زبان طبیعی</textarea></div>
+        <div class="field">Max Q&amp;A pairs per topic<input id="tpairs" type="number" min="5" max="400" value="60"></div>
         <div class="field">Chunk size (chars)<input id="tchunk" type="number" min="300" max="1500" step="50" value="700"></div>
       </div>
       <div class="note">Pipeline: search &rarr; fetch HTML &rarr; clean &rarr; chunk &rarr; generate Q&amp;A &rarr; convert to chat.jsonl. Wikipedia text is CC BY-SA 4.0.</div>
@@ -573,7 +581,7 @@ function renderTrain(s){
   ph.textContent = PHASES[s.phase] || s.phase;
   ph.className = 'pill' + (s.running ? ' live' : s.phase === 'error' ? ' bad' : '');
   $('#tbar').style.width = Math.round((s.progress || 0) * 100) + '%';
-  $('#tStep').textContent = (s.step || 0) + '/6';
+  $('#tStep').textContent = (s.topics > 1 ? 'topic ' + (s.topic_n || 0) + '/' + s.topics + ' · ' : '') + (s.step || 0) + '/6';
   $('#tPar').textContent = s.paragraphs || 0; $('#tCh').textContent = s.chunks || 0;
   $('#tQa').textContent = s.pairs || 0; $('#tRec').textContent = s.records || 0;
   $('#tmsg').textContent = s.title ? 'Article: ' + s.title : '';
@@ -602,25 +610,30 @@ async function tapi(path, body){
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
 }
-async function openTrain(){
-  closeTrain();
-  try { renderTrain(await tapi('/api/train/status')); } catch (e) { $('#terr').textContent = e.message; }
-  if (!window.EventSource) return;
-  const es = trainES = new EventSource('/api/train/stream?since=' + lastLogId);
-  es.addEventListener('log', ev => addLogLine(JSON.parse(ev.data)));
-  es.addEventListener('state', ev => renderTrain(JSON.parse(ev.data)));
+let trainPoll = null;
+async function pollTrain(){
+  clearTimeout(trainPoll);
+  if (view !== 'train') return;
+  let running = false;
+  try {
+    const s = await tapi('/api/train/status?since=' + lastLogId);
+    (s.logs || []).forEach(addLogLine);
+    renderTrain(s); running = s.running;
+  } catch (e) { $('#terr').textContent = e.message; }
+  // poll fast while a run is active, slowly otherwise (works through tunnels / proxies that buffer streams)
+  trainPoll = setTimeout(pollTrain, running ? 700 : 2500);
 }
-function closeTrain(){ if (trainES) { trainES.close(); trainES = null; } }
+function openTrain(){ closeTrain(); pollTrain(); }
+function closeTrain(){ clearTimeout(trainPoll); }
 $('#tstart').onclick = async () => {
   $('#terr').textContent = '';
   try {
-    await tapi('/api/train/start', {topic: $('#ttopic').value, lang: $('#tlang').value,
+    await tapi('/api/train/start', {topics: $('#ttopic').value,
       max_pairs: +$('#tpairs').value, chunk_size: +$('#tchunk').value});
     lastLogId = 0; $('#tlog').textContent = ''; $('#tlog').dataset.empty = '0';
     openTrain();
   } catch (e) { $('#terr').textContent = e.message; }
 };
-$('#ttopic').addEventListener('keydown', e => { if (e.key === 'Enter') $('#tstart').click(); });
 $('#tstop').onclick = async () => { try { await tapi('/api/train/stop', {}); } catch (e) { $('#terr').textContent = e.message; } };
 $('#tclear').onclick = async () => {
   if (!confirm('Discard the current chat.jsonl state?')) return;

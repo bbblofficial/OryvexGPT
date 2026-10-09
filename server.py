@@ -116,7 +116,11 @@ class WebHandler(BaseHTTPRequestHandler):
                 return self._json(403, {"error": "Bad or missing admin token."})
             self._json(200, self.learner.status())
         elif url.path == "/api/train/status":
-            self._json(200, self.trainer.status())
+            try:
+                since = int(parse_qs(url.query)["since"][0])
+            except (KeyError, ValueError, IndexError):
+                since = None
+            self._json(200, self.trainer.status(since))
         elif url.path == "/api/train/stream":
             self._train_stream(parse_qs(url.query))
         elif url.path == "/api/train/download":

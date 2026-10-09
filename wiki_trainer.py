@@ -56,8 +56,14 @@ from learn import (SYSTEM, FetchError, Fetcher, clean_text, good_paragraph,
 LANGS = ("en", "fa")
 WIKI_API = "https://{lang}.wikipedia.org/w/api.php"
 LOG_LIMIT = 2000
+MAX_TOPICS = 20
 PREVIEW_LIMIT = 8
 ROLES = ("system", "user", "assistant")
+
+
+def detect_lang(text: str) -> str:
+    """'fa' if the topic is written in Persian/Arabic script, otherwise 'en'."""
+    return "fa" if re.search(r"[\u0600-\u06ff]", text) else "en"
 
 
 # =================================================================== 3. CLEANING
@@ -388,7 +394,7 @@ class WikiTrainer:
     @staticmethod
     def _fresh() -> dict:
         return {"phase": "idle", "step": 0, "steps": 6, "topic": "", "lang": "en", "title": "",
-                "url": "", "progress": 0.0, "chunks": 0, "paragraphs": 0, "removed": 0,
+                "url": "", "topic_n": 0, "topics": 1, "progress": 0.0, "chunks": 0, "paragraphs": 0, "removed": 0,
                 "pairs": 0, "format": "chat.jsonl", "ready": False}
 
     # ---- logging / status
@@ -407,12 +413,13 @@ class WikiTrainer:
     def running(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
-    def status(self) -> dict:
+    def status(self, since: int | None = None) -> dict:
         with self.lock:
             prev = [{"question": r["messages"][1]["content"], "answer": r["messages"][2]["content"]}
                     for r in self.records[:PREVIEW_LIMIT]]
             return {**self.state, "running": self.running(), "records": len(self.records), "preview": prev,
-                    "last_log": self.logs[-1]["id"] if self.logs else 0}
+                    "last_log": self.logs[-1]["id"] if self.logs else 0,
+                    **({"logs": [e for e in self.logs if e["id"] > since]} if since is not None else {})}
 
     def wait_logs(self, since: int, timeout: float = 15.0) -> tuple[list[dict], dict]:
         """Block until there are log lines newer than `since` (or timeout); used by the SSE stream."""
@@ -430,22 +437,28 @@ class WikiTrainer:
     # ---- control
     @staticmethod
     def _normalise(o: dict):
-        topic = " ".join(str(o.get("topic", "")).split())
-        if not topic:
-            return "Type a topic first."
-        if len(topic) > 120:
-            return "Topic is too long (max 120 characters)."
-        lang = o.get("lang", "en")
-        if lang not in LANGS:
-            return "Language must be 'en' or 'fa'."
+        raw = o.get("topics", o.get("topic", ""))
+        if isinstance(raw, str):
+            raw = re.split(r"[\n;,،]+", raw)
+        topics: list[str] = []
+        for t in raw or []:
+            t = " ".join(str(t).split())
+            if t and t.lower() not in [x.lower() for x in topics]:
+                topics.append(t)
+        if not topics:
+            return "Type at least one topic."
+        if len(topics) > MAX_TOPICS:
+            return f"Too many topics (max {MAX_TOPICS} per run)."
+        if any(len(t) > 120 for t in topics):
+            return "A topic is too long (max 120 characters)."
 
         def clamp(v, lo, hi, d):
             try:
                 return max(lo, min(hi, int(v)))
             except (TypeError, ValueError):
                 return d
-        return {"topic": topic, "lang": lang,
-                "max_pairs": clamp(o.get("max_pairs", 60), 5, 400, 60),
+        return {"topics": topics,
+                "max_pairs": clamp(o.get("max_pairs", 60), 5, 400, 60),   # per topic
                 "chunk_size": clamp(o.get("chunk_size", 700), 300, 1500, 700)}
 
     def start(self, opts: dict) -> str | None:
@@ -457,7 +470,8 @@ class WikiTrainer:
                 return "A run is already in progress."
             self.stop_event.clear()
             self.logs.clear()
-            self.state = {**self._fresh(), "phase": "searching", "topic": o["topic"], "lang": o["lang"]}
+            self.state = {**self._fresh(), "phase": "searching", "topic": ", ".join(o["topics"]), "lang": "auto",
+                          "topic_n": 0, "topics": len(o["topics"])}
             self.thread = threading.Thread(target=self._run, args=(o,), daemon=True)
             self.thread.start()
         return None
@@ -490,7 +504,9 @@ class WikiTrainer:
         return j
 
     def _step(self, n: int, phase: str, msg: str):
-        self._set(step=n, phase=phase, progress=(n - 1) / 6)
+        t = self.state
+        base = t.get("topic_n", 1) - 1
+        self._set(step=n, phase=phase, progress=(base + (n - 1) / 6) / max(1, t.get("topics", 1)))
         self._log(f"[{n}/6] {msg}", "step")
 
     def _stopped(self) -> bool:
@@ -500,91 +516,119 @@ class WikiTrainer:
             return True
         return False
 
+    def _process_topic(self, fetcher, topic, o, blocklist):
+        """Steps 1-5 for one topic. Returns [(kind, q, a)] or None if stopped."""
+        lang = detect_lang(topic)
+        self._set(lang=lang)
+        self._log(f"Language detected automatically: {'Persian' if lang == 'fa' else 'English'} -> {lang}.wikipedia.org")
+        # 1. SEARCH
+        self._step(1, "searching", f"Searching Wikipedia ({lang}) for '{topic}'...")
+        res = self._api(fetcher, lang, {"action": "query", "list": "search", "srsearch": topic,
+                                        "srnamespace": "0", "srlimit": "5", "srprop": "snippet"})
+        hits = [h["title"] for h in res.get("query", {}).get("search", [])]
+        if not hits:
+            raise FetchError(f"No Wikipedia article found for '{topic}'.")
+        self._log(f"Search returned {len(hits)} candidate(s): " + "; ".join(hits))
+        if self._stopped():
+            return None
+
+        # 2. FETCH (try candidates until one is a real article)
+        article = None
+        for title in hits:
+            self._step(2, "fetching", f"Fetching article '{title}' (rendered HTML)...")
+            page = self._api(fetcher, lang, {"action": "parse", "page": title, "prop": "text",
+                                             "redirects": "1", "disableeditsection": "1",
+                                             "disablelimitreport": "1", "disabletoc": "1"})
+            parsed = page.get("parse", {})
+            html = parsed.get("text", "")
+            if isinstance(html, dict):
+                html = html.get("*", "")
+            self._log(f"Downloaded {len(html):,} characters of raw HTML for '{parsed.get('title', title)}'.")
+            # 3. CLEAN
+            self._step(3, "cleaning", "Cleaning text: removing menus, infoboxes, tables, references, edit links...")
+            cleaned = clean_article_html(html)
+            if cleaned["disambiguation"] or len(cleaned["paragraphs"]) < 2:
+                self._log(f"'{title}' is a disambiguation / stub page, trying the next candidate.", "warn")
+                continue
+            article = (parsed.get("title", title), cleaned)
+            break
+        if article is None:
+            raise FetchError(f"None of the search results for '{topic}' was a usable article.")
+        title, cleaned = article
+        paras = cleaned["paragraphs"]
+        chars = sum(len(t) for _, t in paras)
+        url = f"https://{lang}.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+        self._set(title=title, url=url, paragraphs=self.state["paragraphs"] + len(paras),
+                  removed=self.state["removed"] + cleaned["removed"])
+        self._log(f"Removed {cleaned['removed']} non-prose elements. Kept {len(paras)} paragraphs "
+                  f"({chars:,} characters of clean text) in {len({s for s, _ in paras})} section(s).")
+        if self._stopped():
+            return None
+
+        # 4. CHUNK
+        self._step(4, "chunking", f"Splitting text into logical chunks (~{o['chunk_size']} characters, sentence-aligned)...")
+        chunks = make_chunks(paras, o["chunk_size"])
+        self._set(chunks=self.state["chunks"] + len(chunks))
+        self._log(f"Created {len(chunks)} chunks.")
+        if not chunks:
+            raise FetchError("The article had no usable text.")
+        if self._stopped():
+            return None
+
+        # 5. Q&A
+        self._step(5, "generating", "Generating Q&A pairs from the chunks...")
+        base = self.state["topic_n"] - 1
+        total = self.state["topics"]
+
+        def progress(i, n, added):
+            self._set(progress=(base + (4 + i / n) / 6) / total, pairs=self.state["pairs"] + added)
+            self._log(f"Generating Q&A pairs... chunk {i}/{n} -> +{added} pair(s)")
+            if self.stop_event.is_set():
+                raise InterruptedError
+
+        try:
+            pairs = generate_pairs(title, chunks, lang, o["max_pairs"], blocklist, progress)
+        except InterruptedError:
+            self._stopped()
+            return None
+        kinds: dict[str, int] = {}
+        for k, _, _ in pairs:
+            kinds[k] = kinds.get(k, 0) + 1
+        self._log("Pair types: " + (", ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "none"))
+        return pairs
+
     def _run(self, o: dict):
-        topic, lang = o["topic"], o["lang"]
+        topics, n = o["topics"], len(o["topics"])
         try:
             blocklist = load_blocklist(self.data_dir)
             fetcher = Fetcher(delay=1.0, max_bytes=6_000_000)
-            self._log(f"Training request: topic='{topic}' language={lang} max_pairs={o['max_pairs']} "
-                      f"chunk_size={o['chunk_size']}")
-
-            # 1. SEARCH
-            self._step(1, "searching", f"Searching Wikipedia ({lang}) for '{topic}'...")
-            res = self._api(fetcher, lang, {"action": "query", "list": "search", "srsearch": topic,
-                                            "srnamespace": "0", "srlimit": "5", "srprop": "snippet"})
-            hits = [h["title"] for h in res.get("query", {}).get("search", [])]
-            if not hits:
-                raise FetchError(f"No Wikipedia article found for '{topic}'.")
-            self._log(f"Search returned {len(hits)} candidate(s): " + "; ".join(hits))
-            if self._stopped():
-                return
-
-            # 2. FETCH (try candidates until one is a real article)
-            article = None
-            for title in hits:
-                self._step(2, "fetching", f"Fetching article '{title}' (rendered HTML)...")
-                page = self._api(fetcher, lang, {"action": "parse", "page": title, "prop": "text",
-                                                 "redirects": "1", "disableeditsection": "1",
-                                                 "disablelimitreport": "1", "disabletoc": "1"})
-                parsed = page.get("parse", {})
-                html = parsed.get("text", "")
-                if isinstance(html, dict):
-                    html = html.get("*", "")
-                self._log(f"Downloaded {len(html):,} characters of raw HTML for '{parsed.get('title', title)}'.")
-                # 3. CLEAN
-                self._step(3, "cleaning", "Cleaning text: removing menus, infoboxes, tables, references, edit links...")
-                cleaned = clean_article_html(html)
-                if cleaned["disambiguation"] or len(cleaned["paragraphs"]) < 2:
-                    self._log(f"'{title}' is a disambiguation / stub page, trying the next candidate.", "warn")
+            self._log(f"Training request: {n} topic(s) {topics} "
+                      f"max_pairs/topic={o['max_pairs']} chunk_size={o['chunk_size']}")
+            all_pairs: list[tuple[str, str, str]] = []
+            seen_q: set[str] = set()
+            failed = 0
+            for i, topic in enumerate(topics, 1):
+                self._set(topic_n=i)
+                self._log(f"=== Topic {i}/{n}: '{topic}' ===", "step")
+                try:
+                    pairs = self._process_topic(fetcher, topic, o, load_blocklist(self.data_dir) or blocklist)
+                except Exception as e:  # one bad topic must not kill the whole run
+                    failed += 1
+                    self._log(f"Skipping '{topic}': {e}", "error")
                     continue
-                article = (parsed.get("title", title), cleaned)
-                break
-            if article is None:
-                raise FetchError("None of the search results was a usable article.")
-            title, cleaned = article
-            paras = cleaned["paragraphs"]
-            chars = sum(len(t) for _, t in paras)
-            url = f"https://{lang}.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
-            self._set(title=title, url=url, paragraphs=len(paras), removed=cleaned["removed"], progress=3 / 6)
-            self._log(f"Removed {cleaned['removed']} non-prose elements. Kept {len(paras)} paragraphs "
-                      f"({chars:,} characters of clean text) in {len({s for s, _ in paras})} section(s).")
-            if self._stopped():
-                return
-
-            # 4. CHUNK
-            self._step(4, "chunking", f"Splitting text into logical chunks (~{o['chunk_size']} characters, sentence-aligned)...")
-            chunks = make_chunks(paras, o["chunk_size"])
-            self._set(chunks=len(chunks), progress=4 / 6)
-            self._log(f"Created {len(chunks)} chunks.")
-            if not chunks:
-                raise FetchError("The article had no usable text.")
-            if self._stopped():
-                return
-
-            # 5. Q&A
-            self._step(5, "generating", "Generating Q&A pairs from the chunks...")
-
-            def progress(i, n, added):
-                self._set(progress=(4 + i / n) / 6, pairs=self.state["pairs"] + added)
-                self._log(f"Generating Q&A pairs... chunk {i}/{n} -> +{added} pair(s)")
-                if self.stop_event.is_set():
-                    raise InterruptedError
-
-            try:
-                pairs = generate_pairs(title, chunks, lang, o["max_pairs"], blocklist, progress)
-            except InterruptedError:
-                self._stopped()
-                return
-            if not pairs:
-                raise FetchError("No question-answer pairs passed the quality filter.")
-            kinds: dict[str, int] = {}
-            for k, _, _ in pairs:
-                kinds[k] = kinds.get(k, 0) + 1
-            self._log("Pair types: " + ", ".join(f"{k}={v}" for k, v in sorted(kinds.items())))
+                if pairs is None:
+                    return  # stopped
+                for kind, q, a in pairs:
+                    if q.lower() not in seen_q:
+                        seen_q.add(q.lower())
+                        all_pairs.append((kind, q, a))
+            if not all_pairs:
+                raise FetchError("No question-answer pairs were produced.")
 
             # 6. CONVERT -> chat.jsonl state (replaces the previous state atomically)
-            self._step(6, "converting", "Converting pairs to chat.jsonl format and validating...")
-            records = [make_record(q, a) for _, q, a in pairs]
+            self._set(step=6, phase="converting", progress=0.98, topic_n=n)
+            self._log(f"[6/6] Converting {len(all_pairs)} pairs to chat.jsonl format and validating...", "step")
+            records = [make_record(q, a) for _, q, a in all_pairs]
             bad = [r for r in records if not validate_record(r)]
             if bad:
                 raise ValueError(f"{len(bad)} record(s) failed chat.jsonl validation.")
@@ -593,8 +637,8 @@ class WikiTrainer:
                 self.state.update(phase="done", step=6, progress=1.0, pairs=len(records), ready=True)
                 self.cond.notify_all()
             size = len(self.chat_jsonl().encode("utf-8"))
-            self._log(f"State set to chat.jsonl: {len(records)} valid conversation(s), {size:,} bytes. "
-                      "Ready to download.", "ok")
+            self._log(f"State set to chat.jsonl: {len(records)} valid conversation(s) from {n - failed}/{n} topic(s), "
+                      f"{size:,} bytes. Ready to download.", "ok")
         except Exception as e:  # keep the panel alive whatever happens
             self._set(phase="error")
             self._log(f"Error: {e}", "error")
