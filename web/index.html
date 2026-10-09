@@ -281,6 +281,10 @@ Large language model
         <div class="field">Max Q&amp;A pairs per topic<input id="tpairs" type="number" min="5" max="400" value="60"></div>
         <div class="field">Chunk size (chars)<input id="tchunk" type="number" min="300" max="1500" step="50" value="700"></div>
       </div>
+      <div class="row">
+        <div class="field" style="flex:1;min-width:220px">Your e-mail (optional, sent to Wikipedia in the User-Agent; Wikimedia gives identified users more room)<input id="tcontact" type="text" maxlength="100" placeholder="you@example.com" autocomplete="email"></div>
+        <label class="check"><input id="tappend" type="checkbox" checked> Also add the new conversations to <code>data/chat.jsonl</code> (skips duplicates)</label>
+      </div>
       <div class="note">Pipeline: search &rarr; fetch HTML &rarr; clean &rarr; chunk &rarr; generate Q&amp;A &rarr; convert to chat.jsonl. Wikipedia text is CC BY-SA 4.0.</div>
     </div>
 
@@ -628,7 +632,7 @@ function closeTrain(){ clearTimeout(trainPoll); }
 $('#tstart').onclick = async () => {
   $('#terr').textContent = '';
   try {
-    await tapi('/api/train/start', {topics: $('#ttopic').value,
+    await tapi('/api/train/start', {topics: $('#ttopic').value, contact: $('#tcontact').value.trim(), append: $('#tappend').checked,
       max_pairs: +$('#tpairs').value, chunk_size: +$('#tchunk').value});
     lastLogId = 0; $('#tlog').textContent = ''; $('#tlog').dataset.empty = '0';
     openTrain();

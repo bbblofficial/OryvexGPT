@@ -46,6 +46,7 @@ import os
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 from html.parser import HTMLParser
 from pathlib import Path
@@ -130,7 +131,8 @@ class _ArticleParser(HTMLParser):
     # -- HTMLParser hooks
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
-        if "disambigbox" in (a.get("class") or "") or "mw-disambig" in (a.get("class") or ""):
+        # only the notice box counts; ordinary links to disambiguation pages carry class "mw-disambig"
+        if tag in ("div", "table") and {"disambigbox", "dmbox-disambig"} & set((a.get("class") or "").split()):
             self.disambiguation = True
         if tag in self.VOID:
             if tag == "br" and not self.drop:
@@ -457,7 +459,10 @@ class WikiTrainer:
                 return max(lo, min(hi, int(v)))
             except (TypeError, ValueError):
                 return d
-        return {"topics": topics,
+        contact = " ".join(str(o.get("contact", "")).split())[:100]
+        if contact and not re.fullmatch(r"[\w.+-]+@[\w-]+\.[\w.-]+|https?://\S+", contact):
+            return "Contact must be an e-mail address or a website URL (or leave it empty)."
+        return {"topics": topics, "contact": contact, "append": bool(o.get("append", True)),
                 "max_pairs": clamp(o.get("max_pairs", 60), 5, 400, 60),   # per topic
                 "chunk_size": clamp(o.get("chunk_size", 700), 300, 1500, 700)}
 
@@ -497,7 +502,22 @@ class WikiTrainer:
     def _api(self, fetcher: Fetcher, lang: str, params: dict) -> dict:
         base = os.environ.get("ORYVEX_WIKI_API", WIKI_API).format(lang=lang)
         url = base + "?" + urllib.parse.urlencode({"format": "json", "formatversion": "2", **params})
-        data, _, _ = fetcher.get(url, "application/json", check_robots=False)  # documented API, rate limited
+        for attempt in range(6):
+            try:
+                data, _, _ = fetcher.get(url, "application/json", check_robots=False)  # documented API
+                break
+            except urllib.error.HTTPError as e:
+                if e.code not in (429, 503) or attempt == 5:
+                    raise
+                try:
+                    wait = float(e.headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    wait = 0
+                wait = min(120.0, max(wait, 8.0 * 2 ** attempt))
+                self._log(f"Wikipedia asked us to slow down (HTTP {e.code}). Waiting {wait:.0f}s, "
+                          f"then retrying ({attempt + 1}/5)...", "warn")
+                if self.stop_event.wait(wait):
+                    raise InterruptedError
         j = json.loads(data.decode("utf-8"))
         if "error" in j:
             raise FetchError(j["error"].get("info", "Wikipedia API error"))
@@ -547,7 +567,7 @@ class WikiTrainer:
             # 3. CLEAN
             self._step(3, "cleaning", "Cleaning text: removing menus, infoboxes, tables, references, edit links...")
             cleaned = clean_article_html(html)
-            if cleaned["disambiguation"] or len(cleaned["paragraphs"]) < 2:
+            if (cleaned["disambiguation"] and len(cleaned["paragraphs"]) < 15) or len(cleaned["paragraphs"]) < 2:
                 self._log(f"'{title}' is a disambiguation / stub page, trying the next candidate.", "warn")
                 continue
             article = (parsed.get("title", title), cleaned)
@@ -597,11 +617,42 @@ class WikiTrainer:
         self._log("Pair types: " + (", ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "none"))
         return pairs
 
+    def _append_to_dataset(self, records: list[dict]):
+        """Add the new conversations to data/chat.jsonl, skipping questions that are already there."""
+        path = self.data_dir / "chat.jsonl"
+        known: set[str] = set()
+        needs_nl = False
+        if path.exists():
+            raw = path.read_text(encoding="utf-8")
+            needs_nl = bool(raw) and not raw.endswith("\n")
+            for line in raw.splitlines():
+                try:
+                    msgs = json.loads(line)["messages"]
+                    known.add(next(m["content"] for m in msgs if m["role"] == "user").strip().lower())
+                except Exception:
+                    continue
+        new = []
+        for r in records:
+            q = r["messages"][1]["content"].strip().lower()
+            if q not in known:
+                known.add(q)
+                new.append(r)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            if needs_nl:
+                f.write("\n")
+            for r in new:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        self._log(f"Appended {len(new)} new conversation(s) to {path.as_posix()} "
+                  f"({len(records) - len(new)} duplicate(s) skipped).", "ok")
+
     def _run(self, o: dict):
         topics, n = o["topics"], len(o["topics"])
         try:
+            if o["contact"]:
+                os.environ["ORYVEX_CONTACT"] = o["contact"]  # identifies us in the User-Agent, as Wikimedia asks
             blocklist = load_blocklist(self.data_dir)
-            fetcher = Fetcher(delay=1.0, max_bytes=6_000_000)
+            fetcher = Fetcher(delay=2.5, max_bytes=8_000_000)  # slow and polite: ~1 request / 2.5 s
             self._log(f"Training request: {n} topic(s) {topics} "
                       f"max_pairs/topic={o['max_pairs']} chunk_size={o['chunk_size']}")
             all_pairs: list[tuple[str, str, str]] = []
@@ -612,6 +663,9 @@ class WikiTrainer:
                 self._log(f"=== Topic {i}/{n}: '{topic}' ===", "step")
                 try:
                     pairs = self._process_topic(fetcher, topic, o, load_blocklist(self.data_dir) or blocklist)
+                except InterruptedError:
+                    self._stopped()
+                    return
                 except Exception as e:  # one bad topic must not kill the whole run
                     failed += 1
                     self._log(f"Skipping '{topic}': {e}", "error")
@@ -639,6 +693,10 @@ class WikiTrainer:
             size = len(self.chat_jsonl().encode("utf-8"))
             self._log(f"State set to chat.jsonl: {len(records)} valid conversation(s) from {n - failed}/{n} topic(s), "
                       f"{size:,} bytes. Ready to download.", "ok")
+            if o["append"]:
+                self._append_to_dataset(records)
+            if failed:
+                self._log(f"{failed} topic(s) failed. Run them again later (duplicates are skipped when appending).", "warn")
         except Exception as e:  # keep the panel alive whatever happens
             self._set(phase="error")
             self._log(f"Error: {e}", "error")
