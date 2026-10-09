@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from engine import BOT_NAME, ChatSession, OryvexEngine
+from wiki_trainer import WikiTrainer
 
 MAX_BODY_BYTES = 1_000_000
 MAX_WEB_SESSIONS = 100
@@ -42,6 +43,7 @@ def clean_sid(value) -> str:
 class WebHandler(BaseHTTPRequestHandler):
     engine: OryvexEngine = None  # set in run_web
     learner = None               # LearnManager when learn mode is enabled
+    trainer: WikiTrainer = None  # Wikipedia Training page (always available)
     admin_token = None
     sessions = SessionStore()
     server_version = f"{BOT_NAME}/1.0"
@@ -74,6 +76,32 @@ class WebHandler(BaseHTTPRequestHandler):
             raise ValueError("Expected a JSON object.")
         return data
 
+    def _train_stream(self, query: dict):
+        """Server-Sent Events: pushes every new log line the moment it is written."""
+        try:
+            last = int(query.get("since", ["0"])[0])
+        except ValueError:
+            last = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            self.wfile.write(b"retry: 2000\n\n")
+            while True:
+                entries, state = self.trainer.wait_logs(last, 15.0)
+                if entries:
+                    last = entries[-1]["id"]
+                    for e in entries:
+                        self.wfile.write(f"id: {e['id']}\nevent: log\ndata: {json.dumps(e)}\n\n".encode("utf-8"))
+                    self.wfile.write(f"event: state\ndata: {json.dumps(self.trainer.status())}\n\n".encode("utf-8"))
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+
     # -- routes
     def do_GET(self):
         url = urlparse(self.path)
@@ -87,6 +115,21 @@ class WebHandler(BaseHTTPRequestHandler):
             if not self._admin_ok():
                 return self._json(403, {"error": "Bad or missing admin token."})
             self._json(200, self.learner.status())
+        elif url.path == "/api/train/status":
+            self._json(200, self.trainer.status())
+        elif url.path == "/api/train/stream":
+            self._train_stream(parse_qs(url.query))
+        elif url.path == "/api/train/download":
+            if not self.trainer.records:
+                return self._json(404, {"error": "Nothing to download yet. Run a training first."})
+            body = self.trainer.chat_jsonl().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="chat.jsonl"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
         elif url.path == "/api/history":
             sid = clean_sid(parse_qs(url.query).get("session", [""])[0])
             self._json(200, {"messages": self.sessions.get(sid).transcript})
@@ -101,6 +144,19 @@ class WebHandler(BaseHTTPRequestHandler):
             data = self._read_json()
         except Exception as exc:
             return self._json(400, {"error": str(exc)})
+
+        if url.path.startswith("/api/train/"):
+            action = url.path.rsplit("/", 1)[-1]
+            if action == "start":
+                err = self.trainer.start(data)
+            elif action == "stop":
+                self.trainer.stop()
+                err = None
+            elif action == "clear":
+                err = self.trainer.clear()
+            else:
+                return self._json(404, {"error": "Not found"})
+            return self._json(400 if err else 200, {"error": err} if err else {"ok": True})
 
         if url.path.startswith("/api/learn/"):
             if self.learner is None:
@@ -159,6 +215,7 @@ def run_web(engine: OryvexEngine, host: str, port: int, open_browser: bool,
             learner=None, admin_token: str | None = None):
     WebHandler.engine = engine
     WebHandler.learner = learner
+    WebHandler.trainer = WikiTrainer()
     WebHandler.admin_token = admin_token
     server = ThreadingHTTPServer((host, port), WebHandler)
     server.daemon_threads = True

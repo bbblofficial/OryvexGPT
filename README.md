@@ -120,6 +120,35 @@ It answers capitals, definitions, Python snippets, Persian greetings and
 These are data/training limits, not bugs: add more examples to `data/`, then
 train longer (`python train.py --resume --steps 3000`) or use `--preset small`.
 
+## Training page (Wikipedia -> chat.jsonl)
+
+Open the web panel (`python app.py --web`) and click **Training** in the header. It
+works without `--learn` and never touches your model: it only builds a dataset.
+
+1. Type a topic (English or Persian) and press **Start training**.
+2. The engine (`wiki_trainer.py`) runs six steps, each written live to the terminal box:
+   1. **Search**: MediaWiki API `list=search`; the best hit is used, disambiguation pages are skipped.
+   2. **Fetch**: MediaWiki API `action=parse`, the article as rendered HTML.
+   3. **Clean**: drops scripts, styles, infoboxes, tables, navboxes, table of contents, hatnotes,
+      image thumbnails, edit links, `[12]`-style citations and the See also / References /
+      External links sections.
+   4. **Chunk**: merges paragraphs per section into chunks of about 700 characters, cut only at
+      sentence ends (handles "Dr.", "U.S." and similar).
+   5. **Q&A**: rule-based synthetic pairs, every answer copied from the article: definition
+      ("What is X?"), overview, per-section, "By whom was X created?", "What happened in 1991...?"
+      and "What is Y?" for "Y is a ..." sentences. Answers pass the Learn-mode quality filter
+      (length, English/Persian script, no e-mails or long numbers, `data/blocklist.txt`).
+   6. **Convert**: each pair becomes one `{"messages":[system,user,assistant]}` line. The server's
+      internal state holds exactly those objects (validated strictly) and nothing else.
+3. **Download chat.jsonl** serves that state. Put the file in `data/` (or append it to
+   `data/chat.jsonl`) and run `python train.py` to train on it.
+
+Notes: a new run replaces the previous state; **Clear state** empties it. The state lives in the
+server process and is shared by everyone who can open the panel, so keep the panel on
+`127.0.0.1` (the default). Set `ORYVEX_CONTACT` to your e-mail, as Wikimedia asks. Wikipedia text is
+CC BY-SA 4.0. Q&A made this way is simple extraction, not deep understanding: review the preview
+before training on it.
+
 ## Learn mode (web panel)
 
 Start the panel with learn mode switched on:
